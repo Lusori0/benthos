@@ -1,6 +1,7 @@
 module github.com/benthosdev/benthos/v4
 
 replace github.com/99designs/keyring => github.com/Jeffail/keyring v1.2.3
+replace github.com/redis/go-redis/v9 => ../go-redis
 
 require (
 	cloud.google.com/go/bigquery v1.54.0
