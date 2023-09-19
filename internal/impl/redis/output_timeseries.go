@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -13,9 +14,14 @@ import (
 )
 
 const (
-	tsFieldKey       = "key"
-	tsFieldTimestamp = "timestamp"
-	tsFieldValue     = "value"
+	tsFieldKey             = "key"
+	tsFieldTimestamp       = "timestamp"
+	tsFieldValue           = "value"
+	tsFieldRetention       = "retention"
+	tsFieldChunkSize       = "chunksize"
+	tsFieldEncoding        = "encoding"
+	tsFieldDuplicatePolicy = "duplicatepolicy"
+	tsFieldLabels          = "labels"
 )
 
 func redisTimeseriesOutputConfig() *service.ConfigSpec {
@@ -24,11 +30,7 @@ func redisTimeseriesOutputConfig() *service.ConfigSpec {
 		Stable().
 		Summary(`Sets Redis timeseries data using the TS.ADD command.`).
 		Description(output.Description(true, false, `
-The field `+"`key`"+` supports [interpolation functions](/docs/configuration/interpolation#bloblang-queries), allowing you to create a unique key for each message.
-
-The field `+"`timestamp`"+` supports [interpolation functions](/docs/configuration/interpolation#bloblang-queries), allowing flexibility in setting the timestamp for the entry. If you want benthos to set the current time as a timestamp use `+"`${! timestamp_unix_milli() }`"+` as the value
-
-The field `+"`value`"+` supports [interpolation functions](/docs/configuration/interpolation#bloblang-queries).`)).
+The field `+"`timestamp`"+` supports [interpolation functions](/docs/configuration/interpolation#bloblang-queries), allowing flexibility in setting the timestamp for the entry. If you want benthos to set the current time as a timestamp use `+"`${! timestamp_unix_milli() }`"+` as its value`)).
 		Categories("Services").
 		Fields(clientFields()...).
 		Fields(
@@ -41,6 +43,29 @@ The field `+"`value`"+` supports [interpolation functions](/docs/configuration/i
 			service.NewInterpolatedStringField(tsFieldValue).
 				Description("Value of the timeseries entry. Must be a number.").
 				Examples("${! this.cpu_usage }", "3.1415"),
+			service.NewDurationField(tsFieldRetention).
+				Description("Specifies the duration for which Redis will keep the timeseries entries.").
+				Examples("48h").
+				Optional().
+				Advanced(),
+			service.NewIntField(tsFieldChunkSize).
+				Description("Chunk size for new allocations. Must be between [48 .. 1048576] and in multiples of 8. For more information visit the [Redis docs](https://redis.io/commands/ts.create/).").
+				Examples(16384).
+				Optional().
+				Advanced(),
+			service.NewBoolField(tsFieldEncoding).
+				Description("Specifies if Redis should compress the data.").
+				Optional().
+				Advanced(),
+			service.NewStringEnumField(tsFieldDuplicatePolicy, "BLOCK", "FIRST", "LAST", "MIN", "MAX", "SUM").
+				Description("Specifies how insertion of samples with identical timestamps should be handled. For more information visit the [Redis docs](https://redis.io/commands/ts.create/).").
+				Optional().
+				Advanced(),
+			service.NewInterpolatedStringMapField(tsFieldLabels).
+				Description("A map of key/value pairs to set as labels for timeseries keys.").
+				Optional().
+				Examples(map[string]string{"location": "${! this.location }", "provider": "aws"}).
+				Advanced(),
 			service.NewOutputMaxInFlightField(),
 		)
 
@@ -64,9 +89,14 @@ func init() {
 type redisTimeseriesWriter struct {
 	log *service.Logger
 
-	key       *service.InterpolatedString
-	timestamp *service.InterpolatedString
-	value     *service.InterpolatedString
+	key             *service.InterpolatedString
+	timestamp       *service.InterpolatedString
+	value           *service.InterpolatedString
+	retention       *time.Duration
+	chunksize       *int
+	encoding        *bool
+	duplicatepolicy *string
+	labels          *map[string]*service.InterpolatedString
 
 	clientCtor func() (redis.UniversalClient, error)
 	client     redis.UniversalClient
@@ -91,6 +121,41 @@ func newRedisTimeseriesWriter(conf *service.ParsedConfig, mgr *service.Resources
 	}
 	if r.value, err = conf.FieldInterpolatedString(tsFieldValue); err != nil {
 		return
+	}
+	if conf.Contains(tsFieldRetention) {
+		retention, err := conf.FieldDuration(tsFieldRetention)
+		if err != nil {
+			return nil, err
+		}
+		r.retention = &retention
+	}
+	if conf.Contains(tsFieldChunkSize) {
+		chunksize, err := conf.FieldInt(tsFieldChunkSize)
+		if err != nil {
+			return nil, err
+		}
+		r.chunksize = &chunksize
+	}
+	if conf.Contains(tsFieldEncoding) {
+		encoding, err := conf.FieldBool(tsFieldEncoding)
+		if err != nil {
+			return nil, err
+		}
+		r.encoding = &encoding
+	}
+	if conf.Contains(tsFieldDuplicatePolicy) {
+		duplicatepolicy, err := conf.FieldString(tsFieldDuplicatePolicy)
+		if err != nil {
+			return nil, err
+		}
+		r.duplicatepolicy = &duplicatepolicy
+	}
+	if conf.Contains(tsFieldLabels) {
+		labels, err := conf.FieldInterpolatedStringMap(tsFieldLabels)
+		if err != nil {
+			return nil, err
+		}
+		r.labels = &labels
 	}
 	return
 }
@@ -143,7 +208,47 @@ func (r *redisTimeseriesWriter) Write(ctx context.Context, msg *service.Message)
 		return fmt.Errorf("value float conversion error: %w", err)
 	}
 
-	if err := client.TSAdd(ctx, key, timestamp, value).Err(); err != nil {
+	opt := &redis.TSOptions{}
+
+	if r.retention != nil {
+		opt.Retention = int(r.retention.Milliseconds())
+	}
+
+	if r.chunksize != nil {
+		chunksize := *r.chunksize
+		if chunksize%8 != 0 {
+			return fmt.Errorf("chunksize must be multiple of 8")
+		}
+		if chunksize < 48 || chunksize > 1048576 {
+			return fmt.Errorf("chunksize must be between [48 .. 1048576]")
+		}
+		opt.ChunkSize = chunksize
+	}
+
+	if r.encoding != nil {
+		if *r.encoding {
+			opt.Encoding = "COMPRESSED"
+		} else {
+			opt.Encoding = "UNCOMPRESSED"
+		}
+	}
+
+	if r.duplicatepolicy != nil {
+		opt.DuplicatePolicy = *r.duplicatepolicy
+	}
+
+	if r.labels != nil {
+		labels := map[string]string{}
+		for k, v := range *r.labels {
+			labels[k], err = v.TryString(msg)
+			if err != nil {
+				return fmt.Errorf("label %v interpolation error: %w", k, err)
+			}
+		}
+		opt.Labels = labels
+	}
+
+	if err := client.TSAddWithArgs(ctx, key, timestamp, value, opt).Err(); err != nil {
 		_ = r.disconnect()
 		r.log.Errorf("Error from redis: %v\n", err)
 		return service.ErrNotConnected
