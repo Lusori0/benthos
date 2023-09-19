@@ -30,7 +30,7 @@ output:
   label: ""
   redis_timeseries:
     url: redis://:6397 # No default (required)
-    key: ${! this.id } # No default (required)
+    key: cpu_usage:${! this.id } # No default (required)
     timestamp: ${! timestamp_unix_milli() } # No default (required)
     value: ${! this.cpu_usage } # No default (required)
     max_in_flight: 64
@@ -54,20 +54,21 @@ output:
       root_cas: ""
       root_cas_file: ""
       client_certs: []
-    key: ${! this.id } # No default (required)
+    key: cpu_usage:${! this.id } # No default (required)
     timestamp: ${! timestamp_unix_milli() } # No default (required)
     value: ${! this.cpu_usage } # No default (required)
+    retention: 48h # No default (optional)
+    chunksize: 16384 # No default (optional)
+    encoding: false # No default (optional)
+    duplicatepolicy: "" # No default (optional)
+    labels: {} # No default (optional)
     max_in_flight: 64
 ```
 
 </TabItem>
 </Tabs>
 
-The field `key` supports [interpolation functions](/docs/configuration/interpolation#bloblang-queries), allowing you to create a unique key for each message.
-
-The field `timestamp` supports [interpolation functions](/docs/configuration/interpolation#bloblang-queries), allowing flexibility in setting the timestamp for the entry. If you want benthos to set the current time as a timestamp use `${! timestamp_unix_milli() }` as the value
-
-The field `value` supports [interpolation functions](/docs/configuration/interpolation#bloblang-queries).
+The field `timestamp` supports [interpolation functions](/docs/configuration/interpolation#bloblang-queries), allowing flexibility in setting the timestamp for the entry. If you want benthos to set the current time as a timestamp use `${! timestamp_unix_milli() }` as its value
 
 ## Performance
 
@@ -276,9 +277,9 @@ Type: `string`
 ```yml
 # Examples
 
-key: ${! this.id }
+key: cpu_usage:${! this.id }
 
-key: machine-${! this.id }
+key: my_key
 ```
 
 ### `timestamp`
@@ -313,6 +314,63 @@ Type: `string`
 value: ${! this.cpu_usage }
 
 value: "3.1415"
+```
+
+### `retention`
+
+Specifies the duration for which Redis will keep the timeseries entries.
+
+
+Type: `string`  
+
+```yml
+# Examples
+
+retention: 48h
+```
+
+### `chunksize`
+
+Chunk size for new allocations. Must be between [48 .. 1048576] and in multiples of 8. For more information visit the [Redis docs](https://redis.io/commands/ts.create/).
+
+
+Type: `int`  
+
+```yml
+# Examples
+
+chunksize: 16384
+```
+
+### `encoding`
+
+Specifies if Redis should compress the data.
+
+
+Type: `bool`  
+
+### `duplicatepolicy`
+
+Specifies how insertion of samples with identical timestamps should be handled. For more information visit the [Redis docs](https://redis.io/commands/ts.create/).
+
+
+Type: `string`  
+Options: `BLOCK`, `FIRST`, `LAST`, `MIN`, `MAX`, `SUM`.
+
+### `labels`
+
+A map of key/value pairs to set as labels for timeseries keys.
+This field supports [interpolation functions](/docs/configuration/interpolation#bloblang-queries).
+
+
+Type: `object`  
+
+```yml
+# Examples
+
+labels:
+  location: ${! this.location }
+  provider: aws
 ```
 
 ### `max_in_flight`
